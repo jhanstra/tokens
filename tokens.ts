@@ -36,6 +36,7 @@
  *   tokens --goal 5000000  # custom monthly output-token goal
  *   tokens --json          # raw JSON summary
  *   tokens --by-day        # per-day breakdown in addition to models
+ *   tokens --no-color      # disable ANSI colors
  *   tokens --verbose       # log each API page as it paginates
  */
 
@@ -105,6 +106,7 @@ type Args = {
   byDay: boolean;
   verbose: boolean;
   help: boolean;
+  noColor: boolean;
 };
 
 function parseArgs(argv: string[]): Args {
@@ -115,6 +117,7 @@ function parseArgs(argv: string[]): Args {
     byDay: false,
     verbose: false,
     help: false,
+    noColor: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -148,6 +151,9 @@ function parseArgs(argv: string[]): Args {
       case "--by-day":
         args.byDay = true;
         break;
+      case "--no-color":
+        args.noColor = true;
+        break;
       case "--verbose":
       case "-v":
         args.verbose = true;
@@ -161,36 +167,137 @@ function parseArgs(argv: string[]): Args {
   return args;
 }
 
-function printHelp(): void {
-  console.log(`tokens — report your Cursor token usage
+// -------- styling --------------------------------------------------------
+//
+// Tiny ANSI helper. No dependencies so this stays a single-file Bun script.
+// Colors are automatically suppressed when stdout isn't a TTY, when NO_COLOR
+// is set, or when the user passes --no-color or --json.
 
-Usage:
-  tokens [options]
+type StyleFn = (s: string | number) => string;
 
-Options:
-  --set-token <value>  Save a WorkosCursorSessionToken to ~/.config/cursor-usage/token
-  --month              Current calendar month (default)
-  --days <N>           Trailing N days instead of current month
-  --since <YYYY-MM-DD> Custom start date (local time, inclusive)
-  --until <YYYY-MM-DD> Custom end date (local time, exclusive). Defaults to now.
-  --goal <N>           Monthly output-token goal (default 5,000,000)
-  --by-day             Also print a per-day breakdown
-  --json               Emit machine-readable JSON instead of the formatted report
-  -v, --verbose        Log each API page as it paginates
-  -h, --help           Show this help
+type Style = {
+  enabled: boolean;
+  reset: string;
+  bold: StyleFn;
+  dim: StyleFn;
+  italic: StyleFn;
+  underline: StyleFn;
+  red: StyleFn;
+  green: StyleFn;
+  yellow: StyleFn;
+  blue: StyleFn;
+  magenta: StyleFn;
+  cyan: StyleFn;
+  gray: StyleFn;
+  // Semantic helpers
+  title: StyleFn;
+  label: StyleFn;
+  value: StyleFn;
+  accent: StyleFn;
+  good: StyleFn;
+  warn: StyleFn;
+  bad: StyleFn;
+  muted: StyleFn;
+};
 
-Token precedence: CURSOR_SESSION_TOKEN env var > cached file at ${TOKEN_PATH}.
+function makeStyle(enabled: boolean): Style {
+  const wrap = (code: string): StyleFn => {
+    if (!enabled) return (s) => String(s);
+    return (s) => `\x1b[${code}m${s}\x1b[0m`;
+  };
+  return {
+    enabled,
+    reset: enabled ? "\x1b[0m" : "",
+    bold: wrap("1"),
+    dim: wrap("2"),
+    italic: wrap("3"),
+    underline: wrap("4"),
+    red: wrap("31"),
+    green: wrap("32"),
+    yellow: wrap("33"),
+    blue: wrap("34"),
+    magenta: wrap("35"),
+    cyan: wrap("36"),
+    gray: wrap("90"),
+    title: wrap("1;36"), // bold cyan
+    label: wrap("90"), // gray
+    value: wrap("1"), // bold default color
+    accent: wrap("36"), // cyan
+    good: wrap("32"), // green
+    warn: wrap("33"), // yellow
+    bad: wrap("31"), // red
+    muted: wrap("2;37"), // dim white
+  };
+}
+
+function shouldUseColor(args: Args): boolean {
+  // Explicit user intent wins.
+  if (args.noColor) return false;
+  if (args.json) return false;
+  // FORCE_COLOR overrides NO_COLOR, matching Node's convention.
+  if (process.env.FORCE_COLOR) return true;
+  if (process.env.NO_COLOR) return false;
+  return Boolean(process.stdout.isTTY);
+}
+
+// Visible width of a string, ignoring ANSI escape sequences. Good enough for
+// the plain ASCII/Unicode chars this CLI uses.
+function visibleLength(s: string): string {
+  return s.replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+function visibleWidth(s: string): number {
+  return visibleLength(s).length;
+}
+
+function padEndVisible(s: string, width: number): string {
+  const pad = Math.max(0, width - visibleWidth(s));
+  return s + " ".repeat(pad);
+}
+
+function padStartVisible(s: string, width: number): string {
+  const pad = Math.max(0, width - visibleWidth(s));
+  return " ".repeat(pad) + s;
+}
+
+function printHelp(style: Style): void {
+  const t = style.title;
+  const b = style.bold;
+  const dim = style.dim;
+  const accent = style.accent;
+  console.log(`${t("tokens")} ${dim("—")} report your Cursor token usage
+
+${b("Usage")}
+  ${accent("tokens")} [options]
+
+${b("Options")}
+  ${accent("--set-token")} <value>   Save a WorkosCursorSessionToken to ~/.config/cursor-usage/token
+  ${accent("--month")}               Current calendar month (default)
+  ${accent("--days")} <N>            Trailing N days instead of current month
+  ${accent("--since")} <YYYY-MM-DD>  Custom start date (local time, inclusive)
+  ${accent("--until")} <YYYY-MM-DD>  Custom end date (local time, exclusive). Defaults to now.
+  ${accent("--goal")} <N>            Monthly output-token goal (default 5,000,000)
+  ${accent("--by-day")}              Also print a per-day breakdown
+  ${accent("--json")}                Emit machine-readable JSON instead of the formatted report
+  ${accent("--no-color")}            Disable ANSI colors
+  ${accent("-v")}, ${accent("--verbose")}         Log each API page as it paginates
+  ${accent("-h")}, ${accent("--help")}            Show this help
+
+${b("Token precedence")}
+  ${dim("CURSOR_SESSION_TOKEN")} env var ${dim(">")} cached file at ${dim(TOKEN_PATH)}
 `);
 }
 
 // -------- token handling -------------------------------------------------
 
-function saveToken(raw: string): void {
+function saveToken(raw: string, style: Style): void {
   const token = normalizeToken(raw);
   mkdirSync(dirname(TOKEN_PATH), { recursive: true });
   writeFileSync(TOKEN_PATH, token, "utf8");
   chmodSync(TOKEN_PATH, 0o600);
-  console.log(`Saved token to ${TOKEN_PATH} (chmod 0600).`);
+  console.log(
+    `${style.good("✓")} Saved token to ${style.accent(TOKEN_PATH)} ${style.dim("(chmod 0600)")}`,
+  );
 }
 
 function loadToken(): string | null {
@@ -299,6 +406,7 @@ async function fetchAllEvents(
   start: Date,
   end: Date,
   verbose: boolean,
+  style: Style,
 ): Promise<UsageEvent[]> {
   const all: UsageEvent[] = [];
   let page = 1;
@@ -309,10 +417,11 @@ async function fetchAllEvents(
     const events = resp.usageEventsDisplay ?? [];
     all.push(...events);
     if (verbose) {
+      const total = resp.totalUsageEventsCount
+        ? ` ${style.dim(`/ ${resp.totalUsageEventsCount}`)}`
+        : "";
       console.error(
-        `[page ${page}] fetched ${events.length} events (running total: ${all.length}${
-          resp.totalUsageEventsCount ? ` / ${resp.totalUsageEventsCount}` : ""
-        })`,
+        `${style.dim(`[page ${page}]`)} fetched ${style.accent(String(events.length))} events ${style.dim(`(running total: ${all.length}${total})`)}`,
       );
     }
     const hasMore = resp.pagination?.hasMore;
@@ -442,10 +551,46 @@ function pct(part: number, whole: number): number {
   return (part / whole) * 100;
 }
 
-function bar(p: number, width = 30): string {
+// Smooth Unicode progress bar. Uses eighth-block glyphs so partial cells are
+// visible, which makes the "am I on pace" read much more accurate than a
+// coarse `####----` bar. Colors shift green→yellow→red as the bar fills.
+function bar(p: number, width = 32, style?: Style): string {
+  const blocks = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"]; // 1/8 .. 7/8
+  const full = "█";
   const clamped = Math.max(0, Math.min(100, p));
-  const filled = Math.round((clamped / 100) * width);
-  return `[${"#".repeat(filled)}${"-".repeat(width - filled)}]`;
+  const totalEighths = (clamped / 100) * width * 8;
+  const fullCells = Math.floor(totalEighths / 8);
+  const remainder = Math.floor(totalEighths - fullCells * 8);
+
+  let filled = full.repeat(fullCells);
+  if (fullCells < width) filled += blocks[remainder] ?? "";
+  const emptyCount = Math.max(0, width - fullCells - (remainder > 0 ? 1 : 0));
+  const empty = "·".repeat(emptyCount);
+
+  if (!style || !style.enabled) return `${filled}${empty}`;
+
+  const color =
+    clamped >= 100 ? style.good : clamped >= 75 ? style.yellow : clamped >= 50 ? style.cyan : style.blue;
+  return `${color(filled)}${style.dim(empty)}`;
+}
+
+function sparkline(values: number[], style?: Style): string {
+  const ticks = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+  if (values.length === 0) return "";
+  const max = Math.max(...values, 1);
+  const out = values
+    .map((v) => {
+      const idx = Math.min(ticks.length - 1, Math.max(0, Math.round((v / max) * (ticks.length - 1))));
+      return ticks[idx];
+    })
+    .join("");
+  return style && style.enabled ? style.cyan(out) : out;
+}
+
+// Section header with a subtle rule underneath.
+function section(title: string, style: Style): string {
+  const rule = "─".repeat(Math.max(8, visibleWidth(title) + 2));
+  return `${style.title(title)}\n${style.dim(rule)}`;
 }
 
 function printReport(
@@ -453,6 +598,7 @@ function printReport(
   totals: ReturnType<typeof aggregate>,
   goal: number,
   showByDay: boolean,
+  style: Style,
 ): void {
   const { overall, today, byModel, byDay } = totals;
   const outputPct = pct(overall.outputTokens, goal);
@@ -477,109 +623,157 @@ function printReport(
     startOfToday().getTime() >= range.start.getTime() &&
     startOfToday().getTime() <= range.end.getTime();
 
-  console.log(`Cursor usage — ${range.label}`);
+  // ------------ header ------------
+  console.log("");
   console.log(
-    `  ${fmtDate(range.start)}  →  ${fmtDate(range.end)}   (${fmtInt(overall.events)} events)\n`,
+    `${style.title("◆ Cursor usage")}  ${style.dim("·")}  ${style.accent(range.label)}`,
   );
+  console.log(
+    `  ${style.label("range")}   ${fmtDate(range.start)} ${style.dim("→")} ${fmtDate(range.end)}   ${style.dim("·")}   ${style.label("events")} ${style.value(fmtInt(overall.events))}`,
+  );
+  console.log("");
 
-  console.log(`  Output tokens:       ${fmtInt(overall.outputTokens)}`);
-  console.log(`  Input tokens:        ${fmtInt(overall.inputTokens)}`);
-  console.log(`  Cache read tokens:   ${fmtInt(overall.cacheReadTokens)}`);
-  console.log(`  Cache write tokens:  ${fmtInt(overall.cacheWriteTokens)}`);
-
-  if (rangeIncludesToday) {
-    console.log(`\nToday so far (${fmtDate(new Date())}):`);
+  // ------------ totals ------------
+  console.log(section("Totals", style));
+  const totalRows: Array<[string, number, StyleFn]> = [
+    ["Output tokens", overall.outputTokens, style.good],
+    ["Input tokens", overall.inputTokens, style.blue],
+    ["Cache read", overall.cacheReadTokens, style.cyan],
+    ["Cache write", overall.cacheWriteTokens, style.magenta],
+  ];
+  const labelW = Math.max(...totalRows.map((r) => r[0].length));
+  const valueW = Math.max(...totalRows.map((r) => fmtInt(r[1]).length));
+  for (const [label, value, color] of totalRows) {
     console.log(
-      `  Output: ${fmtInt(today.outputTokens)}   Input: ${fmtInt(today.inputTokens)}   Events: ${fmtInt(today.events)}`,
+      `  ${style.label(padEndVisible(label, labelW))}   ${color(padStartVisible(fmtInt(value), valueW))}   ${style.dim(padStartVisible(fmtCompact(value), 7))}`,
+    );
+  }
+
+  // ------------ today ------------
+  if (rangeIncludesToday) {
+    console.log("");
+    console.log(section(`Today  ${style.dim(`(${fmtDate(new Date())})`)}`, style));
+    console.log(
+      `  ${style.label("output")} ${style.good(fmtInt(today.outputTokens))}   ${style.label("input")} ${style.blue(fmtInt(today.inputTokens))}   ${style.label("events")} ${style.value(fmtInt(today.events))}`,
     );
     // Compare today's output against the flat per-day share of the monthly
     // goal, so "am I on pace today?" is obvious at a glance.
     const todayVsDailyGoalPct = pct(today.outputTokens, perDayFlatGoal);
+    const paceColor =
+      todayVsDailyGoalPct >= 100 ? style.good : todayVsDailyGoalPct >= 60 ? style.yellow : style.red;
     console.log(
-      `  vs. daily goal share (${fmtInt(Math.round(perDayFlatGoal))}/day): ${bar(todayVsDailyGoalPct, 20)}  ${todayVsDailyGoalPct.toFixed(1)}%`,
+      `  ${style.label("pace ")} ${bar(todayVsDailyGoalPct, 22, style)} ${paceColor(`${todayVsDailyGoalPct.toFixed(1)}%`)}   ${style.dim(`of ${fmtInt(Math.round(perDayFlatGoal))}/day share`)}`,
     );
   }
 
+  // ------------ goal ------------
   console.log("");
-  console.log(`Goal progress (output tokens, goal ${fmtInt(goal)}):`);
-  console.log(`  ${bar(outputPct)}  ${outputPct.toFixed(1)}%`);
+  console.log(section(`Monthly goal  ${style.dim(`(${fmtInt(goal)} output)`)}`, style));
+  const goalColor =
+    outputPct >= 100 ? style.good : outputPct >= 75 ? style.yellow : style.accent;
+  console.log(`  ${bar(outputPct, 32, style)} ${goalColor(`${outputPct.toFixed(1)}%`)}`);
   console.log(
-    `  ${fmtInt(overall.outputTokens)} / ${fmtInt(goal)}   (${fmtInt(remainingToGoal)} remaining)`,
+    `  ${style.label("progress")} ${style.value(fmtInt(overall.outputTokens))} ${style.dim("/")} ${style.dim(fmtInt(goal))}   ${style.label("remaining")} ${style.value(fmtInt(remainingToGoal))}`,
   );
 
   if (isMonthlyView) {
-    console.log(
-      `  Days left in month: ${daysRemaining.toFixed(1)}   Pace needed: ${fmtInt(Math.ceil(perDayToHit))} output tokens/day`,
-    );
-    // What pace are we actually on?
     const dayOfMonth = now.getDate();
-    const elapsedDays = dayOfMonth; // rough, includes today
+    const elapsedDays = dayOfMonth;
     const projected =
       elapsedDays > 0 ? (overall.outputTokens / elapsedDays) * daysInMonth : 0;
     const projectedPct = pct(projected, goal);
+    const projectionColor =
+      projectedPct >= 100 ? style.good : projectedPct >= 75 ? style.yellow : style.red;
+
     console.log(
-      `  Current pace projects to ${fmtInt(Math.round(projected))} (${projectedPct.toFixed(1)}% of goal) by month end.`,
+      `  ${style.label("days left")} ${style.value(daysRemaining.toFixed(1))}   ${style.label("pace needed")} ${style.value(fmtInt(Math.ceil(perDayToHit)))}${style.dim("/day")}`,
+    );
+    console.log(
+      `  ${style.label("projection")} ${projectionColor(fmtInt(Math.round(projected)))} ${style.dim(`(${projectedPct.toFixed(1)}% of goal at current pace)`)}`,
     );
   }
 
+  // ------------ models ------------
   if (byModel.length > 0) {
-    console.log("\nTop models by output tokens:");
+    console.log("");
+    console.log(section("Top models by output", style));
     const topN = byModel.slice(0, 10);
-    const nameWidth = Math.max(...topN.map((m) => m.model.length), 10);
+    const totalOut = overall.outputTokens || 1;
+    const nameW = Math.max(...topN.map((m) => m.model.length), 10);
+    const numW = 8; // width for compact numbers like "12.3k" / "4.56M"
+    const eventsW = Math.max(4, ...topN.map((m) => String(m.events).length));
+
+    // Header row
+    console.log(
+      `  ${style.dim(padEndVisible("model", nameW))}  ${style.dim(padStartVisible("out", numW))}  ${style.dim(padStartVisible("in", numW))}  ${style.dim(padStartVisible("cacheR", numW))}  ${style.dim(padStartVisible("cacheW", numW))}  ${style.dim(padStartVisible("events", eventsW))}  ${style.dim("share")}`,
+    );
     for (const m of topN) {
-      const p = pct(m.outputTokens, overall.outputTokens || 1);
+      const p = pct(m.outputTokens, totalOut);
       console.log(
-        `  ${m.model.padEnd(nameWidth)}  out=${fmtCompact(m.outputTokens).padStart(7)}   in=${fmtCompact(m.inputTokens).padStart(7)}   cacheR=${fmtCompact(m.cacheReadTokens).padStart(7)}   cacheW=${fmtCompact(m.cacheWriteTokens).padStart(7)}   events=${String(m.events).padStart(4)}   ${p.toFixed(1)}%`,
+        `  ${style.value(padEndVisible(m.model, nameW))}  ${style.good(padStartVisible(fmtCompact(m.outputTokens), numW))}  ${style.blue(padStartVisible(fmtCompact(m.inputTokens), numW))}  ${style.cyan(padStartVisible(fmtCompact(m.cacheReadTokens), numW))}  ${style.magenta(padStartVisible(fmtCompact(m.cacheWriteTokens), numW))}  ${style.value(padStartVisible(String(m.events), eventsW))}  ${bar(p, 10, style)} ${style.dim(`${p.toFixed(1)}%`)}`,
       );
     }
     if (byModel.length > topN.length) {
-      console.log(`  …and ${byModel.length - topN.length} more`);
+      console.log(`  ${style.dim(`…and ${byModel.length - topN.length} more`)}`);
     }
   }
 
+  // ------------ per-day ------------
   if (showByDay && byDay.length > 0) {
-    console.log("\nPer-day output tokens:");
+    console.log("");
+    console.log(section("Per-day output", style));
+    const spark = sparkline(byDay.map((d) => d.outputTokens), style);
+    console.log(`  ${style.label("trend")} ${spark}`);
     const maxOut = Math.max(...byDay.map((d) => d.outputTokens), 1);
+    const outW = 8;
+    const evW = Math.max(4, ...byDay.map((d) => String(d.events).length));
     for (const d of byDay) {
       const p = pct(d.outputTokens, maxOut);
       console.log(
-        `  ${d.date}  ${bar(p, 20)}  out=${fmtCompact(d.outputTokens).padStart(7)}   events=${String(d.events).padStart(4)}`,
+        `  ${style.dim(d.date)}  ${bar(p, 24, style)}  ${style.good(padStartVisible(fmtCompact(d.outputTokens), outW))}  ${style.dim("events")} ${style.value(padStartVisible(String(d.events), evW))}`,
       );
     }
   }
+
+  console.log("");
 }
 
 // -------- main -----------------------------------------------------------
 
 async function main(): Promise<void> {
   let args: Args;
+  // Parse with a best-effort style (colors only if TTY) so error output is
+  // styled but still plain in pipelines.
+  const bootstrapStyle = makeStyle(Boolean(process.stdout.isTTY) && !process.env.NO_COLOR);
   try {
     args = parseArgs(process.argv.slice(2));
   } catch (err) {
-    console.error((err as Error).message);
-    printHelp();
+    console.error(`${bootstrapStyle.bad("error:")} ${(err as Error).message}`);
+    printHelp(bootstrapStyle);
     process.exit(2);
   }
 
+  const style = makeStyle(shouldUseColor(args));
+
   if (args.help) {
-    printHelp();
+    printHelp(style);
     return;
   }
 
   if (args.setToken) {
-    saveToken(args.setToken);
+    saveToken(args.setToken, style);
     return;
   }
 
   const token = loadToken();
   if (!token) {
     console.error(
-      `No Cursor session token found.\n\n` +
+      `${style.bad("✗")} No Cursor session token found.\n\n` +
         `Set one with:\n` +
-        `  tokens --set-token '<WorkosCursorSessionToken value>'\n` +
+        `  ${style.accent("tokens --set-token")} '<WorkosCursorSessionToken value>'\n` +
         `or:\n` +
-        `  CURSOR_SESSION_TOKEN='<value>' tokens\n\n` +
-        `How to grab the value: https://cursor.com/dashboard -> DevTools -> Application -> Cookies -> cursor.com -> WorkosCursorSessionToken\n`,
+        `  ${style.accent("CURSOR_SESSION_TOKEN=")}'<value>' tokens\n\n` +
+        `${style.dim("How to grab the value: https://cursor.com/dashboard → DevTools → Application → Cookies → cursor.com → WorkosCursorSessionToken")}\n`,
     );
     process.exit(1);
   }
@@ -587,23 +781,23 @@ async function main(): Promise<void> {
   const range = resolveRange(args);
   if (args.verbose) {
     console.error(
-      `Fetching events from ${range.start.toISOString()} to ${range.end.toISOString()}`,
+      `${style.dim("Fetching events from")} ${style.accent(range.start.toISOString())} ${style.dim("to")} ${style.accent(range.end.toISOString())}`,
     );
   }
 
   let events: UsageEvent[];
   try {
-    events = await fetchAllEvents(token, range.start, range.end, args.verbose);
+    events = await fetchAllEvents(token, range.start, range.end, args.verbose, style);
   } catch (err) {
     const msg = (err as Error).message;
-    console.error(`Failed to fetch usage data: ${msg}`);
+    console.error(`${style.bad("✗ Failed to fetch usage data:")} ${msg}`);
     // Cursor redirects unauthenticated requests to a WorkOS login page, which
     // manifests as 401/403 or — because the path becomes /user_management/… —
     // a 404 referencing `user_management` or `authkit`. Any of those almost
     // always mean the session token is stale.
     if (/401|403|user_management|authkit/i.test(msg)) {
       console.error(
-        `\nYour session token is probably expired. Grab a fresh one from the Cursor dashboard and rerun with --set-token.`,
+        `\n${style.warn("Your session token is probably expired.")} Grab a fresh one from the Cursor dashboard and rerun with ${style.accent("--set-token")}.`,
       );
     }
     process.exit(1);
@@ -635,7 +829,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  printReport(range, totals, args.goal, args.byDay);
+  printReport(range, totals, args.goal, args.byDay, style);
 }
 
 main().catch((err) => {
