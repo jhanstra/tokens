@@ -9,6 +9,10 @@
  * https://cursor.com/api/dashboard/get-filtered-usage-events endpoint that
  * powers the Cursor dashboard.
  *
+ * The monthly goal math is work-day aware: it divides by actual US work days
+ * in the current month (Mon–Fri minus US federal holidays), not 30. See the
+ * work-day helpers section below for details.
+ *
  * --------------------------------------------------------------------------
  * One-time setup
  * --------------------------------------------------------------------------
@@ -365,6 +369,112 @@ function localDayKey(epochMs: number): string {
   return fmtDate(new Date(epochMs));
 }
 
+// -------- work-day helpers ----------------------------------------------
+//
+// A "work day" here is a US Mon–Fri that isn't a US federal holiday. Used
+// by the monthly goal math so the "per-day share" and "pace needed"
+// numbers don't count weekends or Thanksgiving against you.
+
+// Nth weekday of a month, e.g. 3rd Monday of January. `nth` is 1-indexed,
+// `weekday` is 0 (Sun) .. 6 (Sat).
+function nthWeekdayOfMonth(year: number, monthIdx: number, weekday: number, nth: number): Date {
+  const first = new Date(year, monthIdx, 1);
+  const offset = (weekday - first.getDay() + 7) % 7;
+  return new Date(year, monthIdx, 1 + offset + (nth - 1) * 7);
+}
+
+// Last weekday of a month (e.g. last Monday of May for Memorial Day).
+function lastWeekdayOfMonth(year: number, monthIdx: number, weekday: number): Date {
+  const lastDay = new Date(year, monthIdx + 1, 0);
+  const offset = (lastDay.getDay() - weekday + 7) % 7;
+  return new Date(year, monthIdx, lastDay.getDate() - offset);
+}
+
+// Observed date for a holiday that falls on a weekend: Saturday → Friday,
+// Sunday → Monday. Matches the US federal "in lieu of" rules.
+function observedDate(d: Date): Date {
+  const day = d.getDay();
+  if (day === 6) return new Date(d.getFullYear(), d.getMonth(), d.getDate() - 1); // Sat -> Fri
+  if (day === 0) return new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1); // Sun -> Mon
+  return d;
+}
+
+// Compute observed US federal holidays for a given calendar year. Includes
+// Juneteenth (added 2021) and skips it for earlier years so historical
+// ranges stay correct.
+function usFederalHolidays(year: number): Set<string> {
+  const out = new Set<string>();
+  const add = (d: Date) => out.add(fmtDate(observedDate(d)));
+  add(new Date(year, 0, 1)); // New Year's Day
+  add(nthWeekdayOfMonth(year, 0, 1, 3)); // MLK Day (3rd Mon of Jan)
+  add(nthWeekdayOfMonth(year, 1, 1, 3)); // Presidents' Day (3rd Mon of Feb)
+  add(lastWeekdayOfMonth(year, 4, 1)); // Memorial Day (last Mon of May)
+  if (year >= 2021) add(new Date(year, 5, 19)); // Juneteenth
+  add(new Date(year, 6, 4)); // Independence Day
+  add(nthWeekdayOfMonth(year, 8, 1, 1)); // Labor Day (1st Mon of Sep)
+  add(nthWeekdayOfMonth(year, 9, 1, 2)); // Columbus Day (2nd Mon of Oct)
+  add(new Date(year, 10, 11)); // Veterans Day
+  add(nthWeekdayOfMonth(year, 10, 4, 4)); // Thanksgiving (4th Thu of Nov)
+  add(new Date(year, 11, 25)); // Christmas Day
+  return out;
+}
+
+const HOLIDAY_CACHE = new Map<number, Set<string>>();
+function holidaysFor(year: number): Set<string> {
+  let s = HOLIDAY_CACHE.get(year);
+  if (!s) {
+    s = usFederalHolidays(year);
+    HOLIDAY_CACHE.set(year, s);
+  }
+  return s;
+}
+
+function isWorkDay(d: Date): boolean {
+  const day = d.getDay();
+  if (day === 0 || day === 6) return false;
+  return !holidaysFor(d.getFullYear()).has(fmtDate(d));
+}
+
+// Count work days in [start, endExclusive). Caller is responsible for
+// passing local-midnight boundaries.
+function countWorkDays(start: Date, endExclusive: Date): number {
+  let n = 0;
+  const d = new Date(start.getFullYear(), start.getMonth(), start.getDate());
+  const end = new Date(endExclusive.getFullYear(), endExclusive.getMonth(), endExclusive.getDate());
+  while (d.getTime() < end.getTime()) {
+    if (isWorkDay(d)) n++;
+    d.setDate(d.getDate() + 1);
+  }
+  return n;
+}
+
+// Work days in the calendar month containing `d`.
+function workDaysInMonth(d: Date): number {
+  const start = new Date(d.getFullYear(), d.getMonth(), 1);
+  const end = new Date(d.getFullYear(), d.getMonth() + 1, 1);
+  return countWorkDays(start, end);
+}
+
+// Work days strictly before today (so today is never "done" yet).
+function workDaysCompletedInMonth(d: Date): number {
+  const start = new Date(d.getFullYear(), d.getMonth(), 1);
+  const today = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  return countWorkDays(start, today);
+}
+
+// Work days remaining, counting today if it's a work day. This is the
+// denominator you want for "pace needed": how many work days do I still
+// have to spend?
+function workDaysRemainingInMonth(d: Date): number {
+  const today = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const end = new Date(d.getFullYear(), d.getMonth() + 1, 1);
+  return countWorkDays(today, end);
+}
+
+// Sum of completed + remaining always equals workDaysInMonth, which makes
+// the display "N done · M left of T" always add up regardless of whether
+// today is a work day.
+
 // -------- API ------------------------------------------------------------
 
 async function fetchPage(
@@ -604,13 +714,20 @@ function printReport(
   const outputPct = pct(overall.outputTokens, goal);
 
   const now = new Date();
-  const endOfThisMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
-  const msRemaining = endOfThisMonth.getTime() - now.getTime();
-  const daysRemaining = Math.max(0, msRemaining / (24 * 60 * 60 * 1000));
   const remainingToGoal = Math.max(0, goal - overall.outputTokens);
-  const perDayToHit = daysRemaining > 0 ? remainingToGoal / daysRemaining : remainingToGoal;
-  const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
-  const perDayFlatGoal = goal / daysInMonth;
+
+  // Goal math is work-day aware: US Mon–Fri, minus federal holidays. This
+  // keeps the "per-day share" honest on weekends and Thanksgiving.
+  const totalWorkDays = workDaysInMonth(now);
+  const workDaysDone = workDaysCompletedInMonth(now); // strictly before today
+  const workDaysLeft = workDaysRemainingInMonth(now); // today (if work day) + rest
+  // Rate denominator for projection: work days actually in play so far,
+  // counting today as a day you've partially worked if it's a work day.
+  const workDaysInPlay = workDaysDone + (isWorkDay(now) ? 1 : 0);
+  const perWorkDayFlatGoal = totalWorkDays > 0 ? goal / totalWorkDays : goal;
+  const perWorkDayToHit =
+    workDaysLeft > 0 ? remainingToGoal / workDaysLeft : remainingToGoal;
+  const todayIsWorkDay = isWorkDay(now);
 
   const isMonthlyView =
     range.start.getDate() === 1 &&
@@ -656,14 +773,21 @@ function printReport(
     console.log(
       `  ${style.label("output")} ${style.good(fmtInt(today.outputTokens))}   ${style.label("input")} ${style.blue(fmtInt(today.inputTokens))}   ${style.label("events")} ${style.value(fmtInt(today.events))}`,
     );
-    // Compare today's output against the flat per-day share of the monthly
-    // goal, so "am I on pace today?" is obvious at a glance.
-    const todayVsDailyGoalPct = pct(today.outputTokens, perDayFlatGoal);
-    const paceColor =
-      todayVsDailyGoalPct >= 100 ? style.good : todayVsDailyGoalPct >= 60 ? style.yellow : style.red;
-    console.log(
-      `  ${style.label("pace ")} ${bar(todayVsDailyGoalPct, 22, style)} ${paceColor(`${todayVsDailyGoalPct.toFixed(1)}%`)}   ${style.dim(`of ${fmtInt(Math.round(perDayFlatGoal))}/day share`)}`,
-    );
+    // Compare today's output against the flat per-work-day share of the
+    // monthly goal. On weekends/holidays there's no share to hit today —
+    // anything you do is bonus, so we report it that way.
+    if (todayIsWorkDay) {
+      const todayVsDailyGoalPct = pct(today.outputTokens, perWorkDayFlatGoal);
+      const paceColor =
+        todayVsDailyGoalPct >= 100 ? style.good : todayVsDailyGoalPct >= 60 ? style.yellow : style.red;
+      console.log(
+        `  ${style.label("pace ")} ${bar(todayVsDailyGoalPct, 22, style)} ${paceColor(`${todayVsDailyGoalPct.toFixed(1)}%`)}   ${style.dim(`of ${fmtInt(Math.round(perWorkDayFlatGoal))}/work-day share`)}`,
+      );
+    } else {
+      console.log(
+        `  ${style.label("pace ")} ${style.dim("non-work day")}   ${style.dim(`(work-day share is ${fmtInt(Math.round(perWorkDayFlatGoal))}/day)`)}`,
+      );
+    }
   }
 
   // ------------ goal ------------
@@ -677,19 +801,23 @@ function printReport(
   );
 
   if (isMonthlyView) {
-    const dayOfMonth = now.getDate();
-    const elapsedDays = dayOfMonth;
     const projected =
-      elapsedDays > 0 ? (overall.outputTokens / elapsedDays) * daysInMonth : 0;
+      workDaysInPlay > 0 ? (overall.outputTokens / workDaysInPlay) * totalWorkDays : 0;
     const projectedPct = pct(projected, goal);
     const projectionColor =
       projectedPct >= 100 ? style.good : projectedPct >= 75 ? style.yellow : style.red;
 
+    const paceNeeded =
+      workDaysLeft > 0
+        ? `${fmtInt(Math.ceil(perWorkDayToHit))}${style.dim("/work-day")}`
+        : style.dim("none — month is over");
+
+    const todayTag = todayIsWorkDay ? style.dim(" (incl. today)") : style.dim(" (today off)");
     console.log(
-      `  ${style.label("days left")} ${style.value(daysRemaining.toFixed(1))}   ${style.label("pace needed")} ${style.value(fmtInt(Math.ceil(perDayToHit)))}${style.dim("/day")}`,
+      `  ${style.label("work days")} ${style.value(`${workDaysLeft}`)}${style.dim(" left")}${todayTag}${style.dim(` · ${workDaysDone}/${totalWorkDays} done`)}   ${style.label("pace needed")} ${style.value(paceNeeded)}`,
     );
     console.log(
-      `  ${style.label("projection")} ${projectionColor(fmtInt(Math.round(projected)))} ${style.dim(`(${projectedPct.toFixed(1)}% of goal at current pace)`)}`,
+      `  ${style.label("projection")} ${projectionColor(fmtInt(Math.round(projected)))} ${style.dim(`(${projectedPct.toFixed(1)}% of goal at current work-day pace)`)}`,
     );
   }
 
@@ -824,6 +952,21 @@ async function main(): Promise<void> {
         outputPct: pct(totals.overall.outputTokens, args.goal),
         outputRemaining: Math.max(0, args.goal - totals.overall.outputTokens),
       },
+      workDays: (() => {
+        const n = new Date();
+        const total = workDaysInMonth(n);
+        const done = workDaysCompletedInMonth(n);
+        const left = workDaysRemainingInMonth(n);
+        const remaining = Math.max(0, args.goal - totals.overall.outputTokens);
+        return {
+          totalInMonth: total,
+          completedThisMonth: done,
+          remainingInMonth: left,
+          todayIsWorkDay: isWorkDay(n),
+          perWorkDayFlatGoal: total > 0 ? args.goal / total : args.goal,
+          perWorkDayToHit: left > 0 ? remaining / left : remaining,
+        };
+      })(),
     };
     console.log(JSON.stringify(payload, null, 2));
     return;

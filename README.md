@@ -25,14 +25,14 @@ Totals
 Today  (2026-04-16)
 ─────────────────────
   output 172,515   input 561,952   events 23
-  pace  ██████████████████████ 103.5%   of 166,667/day share
+  pace  ██████████████████████ 75.9%    of 227,273/work-day share
 
 Monthly goal  (5,000,000 output)
 ──────────────────────────────────
   ██████████████████▏·············· 56.8%
   progress 2,841,205 / 5,000,000   remaining 2,158,795
-  days left 14.2   pace needed 151,990/day
-  projection 5,328,009 (106.6% of goal at current pace)
+  work days 11 left (incl. today) · 11/22 done   pace needed 196,254/work-day
+  projection 5,328,009 (106.6% of goal at current work-day pace)
 
 Top models by output
 ──────────────────────
@@ -126,10 +126,18 @@ Token precedence: `CURSOR_SESSION_TOKEN` env var beats the cached file.
 - **Output tokens** are the primary metric the goal tracks. Input and cache
   tokens are shown for context.
 - **Today** is always local-timezone midnight onward.
-- **Pace needed** is `remaining / days left in month` (fractional days,
-  including today).
-- **Projection** extrapolates the current calendar-days-elapsed rate (based
-  on day-of-month, rough) to month end, so on day 1 it will look noisy.
+- The monthly goal math is **work-day aware**. A work day is US Monday–Friday
+  minus US federal holidays (including Juneteenth; holidays observed on the
+  adjacent Friday/Monday when they fall on a weekend). So for April 2026
+  the report divides by 22 work days, not 30 calendar days.
+  - **Today's pace** compares today's output against `goal / work-days-in-month`.
+    On weekends and holidays there is no daily share to hit, so the pace
+    line just says "non-work day" and any output is bonus.
+  - **Pace needed** is `remaining / work-days-remaining-in-month`, counting
+    today if today is a work day.
+  - **Projection** is `output-so-far / work-days-in-play * work-days-in-month`,
+    where "in play" means work days fully elapsed plus today when today is a
+    work day. Early in the month this will look noisy.
 - The script re-filters events locally against your requested range in case
   the API returns a slightly wider window.
 
